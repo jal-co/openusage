@@ -53,7 +53,8 @@ struct ProviderAccountAssembly {
         return await make(
             observer: DefaultAccountObserver(),
             accountsStore: ProviderAccountsStore(defaults: defaults),
-            families: families
+            families: families,
+            codexDiscovery: CodexAccountDiscovery()
         )
     }
 
@@ -73,6 +74,7 @@ struct ProviderAccountAssembly {
         observer: DefaultAccountObserver,
         accountsStore: ProviderAccountsStore,
         families: Set<String> = ProviderAccountID.families,
+        codexDiscovery: CodexAccountDiscovery? = nil,
         desktop: ClaudeDesktopAuthStore? = nil,
         listDesktopOrganizationDirectories: @escaping @Sendable (URL) -> [String] = { root in
             let urls = (try? FileManager.default.contentsOfDirectory(
@@ -115,6 +117,19 @@ struct ProviderAccountAssembly {
             case .absent:
                 AppLog.debug(.config, "accounts: \(family) has no default login")
             }
+        }
+
+        var codexCards: [CodexAccountCard] = []
+        if families.contains("codex") {
+            codexCards = assembleCodexCards(
+                outcome: outcomes.first(where: { $0.family == "codex" })?.outcome,
+                discovery: codexDiscovery ?? CodexAccountDiscovery(
+                    environment: observer.environment, files: observer.files, homeDirectory: observer.homeDirectory
+                ),
+                observations: &observations,
+                reconcile: { accountsStore.reconcile(with: $0) },
+                identityKeys: &identityKeys
+            )
         }
 
         guard families.contains("claude") else {

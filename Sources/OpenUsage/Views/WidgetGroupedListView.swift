@@ -233,7 +233,8 @@ struct WidgetGroupedListView: View {
             data: data,
             onToggleResetDisplay: { dataStore.resetDisplayMode.toggle() },
             onToggleMeterStyle: { dataStore.meterStyle.toggle() },
-            condensedTop: condensedTop
+            condensedTop: condensedTop,
+            providerID: providerID
         )
             .environment(\.codexResetClaim, codexResetClaims[providerID])
             .contentShape(Rectangle())
