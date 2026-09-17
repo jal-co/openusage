@@ -12,46 +12,55 @@ final class CodexMultiAccountTests: XCTestCase {
             .replacingOccurrences(of: "=", with: "")
     }
 
-    private func token(accountID: String, email: String, exp: Date? = nil) -> String {
-        var claims = """
-        "https://api.openai.com/auth":{"chatgpt_account_id":"\(accountID)","chatgpt_plan_type":"pro"},
-        "https://api.openai.com/profile":{"email":"\(email)"}
-        """
-        if let exp { claims += #","exp":\#(Int(exp.timeIntervalSince1970))"# }
-        return "\(b64url(#"{"alg":"RS256"}"#)).\(b64url("{\(claims)}")).sig"
+    private func token(accountID: String?, email: String?, exp: Date? = nil) -> String {
+        var claims: [String] = []
+        if let accountID {
+            claims.append(#""https://api.openai.com/auth":{"chatgpt_account_id":"\#(accountID)","chatgpt_plan_type":"pro"}"#)
+        }
+        if let email {
+            claims.append(#""https://api.openai.com/profile":{"email":"\#(email)"}"#)
+        }
+        if let exp { claims.append(#""exp":\#(Int(exp.timeIntervalSince1970))"#) }
+        return "\(b64url(#"{"alg":"RS256"}"#)).\(b64url("{\(claims.joined(separator: ","))}")).sig"
     }
 
-    private func codexAuth(accountID: String?, email: String) -> String {
-        let idToken = token(accountID: accountID ?? "unused", email: email)
-        let account = accountID.map { #","account_id":"\#($0)""# } ?? ""
-        return #"{"tokens":{"access_token":"at-\#(email)","refresh_token":"rt","id_token":"\#(idToken)"\#(account)}}"#
+    private func codexAuth(
+        accountID: String?,
+        email: String,
+        accessAccountID: String? = nil,
+        refreshToken: String? = "rt"
+    ) -> String {
+        let auth = CodexAuth(
+            tokens: CodexTokens(
+                accessToken: token(accountID: accessAccountID ?? accountID, email: email),
+                refreshToken: refreshToken,
+                idToken: token(accountID: accountID, email: email),
+                accountID: accountID
+            ),
+            lastRefresh: nil,
+            apiKey: nil
+        )
+        return String(decoding: try! JSONEncoder().encode(auth), as: UTF8.self)
     }
 
-    private func piAuth(_ entries: [(provider: String, accountID: String, email: String, expires: Int)]) -> String {
+    private func piAuth(_ entries: [(provider: String, accountID: String, email: String)]) -> String {
         let body = entries.map { entry in
-            #""\#(entry.provider)":{"type":"oauth","access":"\#(token(accountID: entry.accountID, email: entry.email))","refresh":"rt","expires":\#(entry.expires),"accountId":"\#(entry.accountID)"}"#
+            #""\#(entry.provider)":{"type":"oauth","access":"\#(token(accountID: entry.accountID, email: entry.email))","refresh":"rt","accountId":"\#(entry.accountID)"}"#
         }.joined(separator: ",")
         return "{\(body)}"
     }
 
     private func makeDiscovery(
         environment: [String: String] = [:],
-        files: [String: String],
+        files: FakeFiles,
         directories: [String: [String]] = [:]
     ) -> CodexAccountDiscovery {
         CodexAccountDiscovery(
             environment: FakeEnvironment(environment),
-            files: FakeFiles(files),
+            files: files,
             homeDirectory: { [home] in home },
             listDirectories: { directories[$0] ?? [] }
         )
-    }
-
-    private func errorBadge(_ snapshot: ProviderSnapshot) -> String? {
-        guard case .badge(_, let text, _, _) = snapshot.lines.first(where: { $0.label == "Error" }) else {
-            return nil
-        }
-        return text
     }
 
     private func makeScratchDefaults() -> UserDefaults {
@@ -62,11 +71,30 @@ final class CodexMultiAccountTests: XCTestCase {
         return defaults
     }
 
+    private func assemble(
+        files: FakeFiles,
+        directories: [String: [String]] = [:],
+        environment: [String: String] = [:],
+        defaults: UserDefaults? = nil
+    ) async -> ProviderAccountAssembly {
+        let observer = DefaultAccountObserver(
+            environment: FakeEnvironment(environment),
+            files: files,
+            keychain: FakeKeychain(),
+            homeDirectory: { [home] in home }
+        )
+        return await ProviderAccountAssembly.make(
+            observer: observer,
+            accountsStore: ProviderAccountsStore(defaults: defaults ?? makeScratchDefaults()),
+            families: ["codex"],
+            codexDiscovery: makeDiscovery(environment: environment, files: files, directories: directories)
+        )
+    }
 
-    func testCandidateHomesCoverDefaultsEnvAndSiblingDirectories() {
+    func testCandidateHomesCoverConfiguredDefaultsAndSiblingDirectories() {
         let discovery = makeDiscovery(
             environment: ["CODEX_HOME": "~/.codex, /opt/codex-ci"],
-            files: [:],
+            files: FakeFiles(),
             directories: [
                 "/Users/dev": [".codex-work", ".codex-personal", ".config", "Documents"],
                 "/Users/dev/.config": ["codex-ci", "codex", "gh"],
@@ -79,38 +107,387 @@ final class CodexMultiAccountTests: XCTestCase {
         ])
     }
 
-    func testHomeLoginsNameTheirAccountFromAccountIDOrIDTokenClaim() {
-        let discovery = makeDiscovery(
-            files: [
-                "/Users/dev/.codex/auth.json": codexAuth(accountID: "ACCT-WORK", email: "me@work.test"),
-                "/Users/dev/.codex-personal/auth.json": codexAuth(accountID: nil, email: "me@home.test"),
-                "/Users/dev/.codex-apikey/auth.json": #"{"OPENAI_API_KEY":"sk-x"}"#,
-            ],
-            directories: ["/Users/dev": [".codex-personal", ".codex-apikey"]]
-        )
+    func testIdentityFallsBackFromIncompleteIDTokenToAccessToken() throws {
+        let auth = try XCTUnwrap(CodexAuthStore.parseAuth(codexAuth(
+            accountID: nil,
+            email: "ME@WORK.TEST",
+            accessAccountID: "ACCT-WORK"
+        )))
 
-        XCTAssertEqual(discovery.homeLogins(), [
-            CodexHomeLogin(home: "/Users/dev/.codex", accountID: "acct-work", email: "me@work.test", planType: "pro"),
-            CodexHomeLogin(home: "/Users/dev/.codex-personal", accountID: "unused", email: "me@home.test", planType: "pro"),
-        ])
+        XCTAssertEqual(CodexAccountIdentity(auth: auth)?.key, "acct-work|me@work.test")
     }
 
-    func testPiLoginsReadEveryCodexEntryWithMultiPassLabels() {
-        let discovery = makeDiscovery(files: [
+    func testPiDiscoveryKeepsEveryMatchingIdentityWithoutSnapshottingTokens() {
+        let files = FakeFiles([
             "/Users/dev/.pi/agent/auth.json": piAuth([
-                ("openai-codex-2", "ACCT-WORK", "me@work.test", 1_800_000_000_000),
-                ("openai-codex", "ACCT-HOME", "me@home.test", 1_700_000_000_000),
-            ]) + "",
+                ("openai-codex-2", "ACCT-WORK", "me@work.test"),
+                ("openai-codex", "ACCT-HOME", "me@home.test"),
+            ]),
             "/Users/dev/.pi/agent/multi-pass.json": #"{"subscriptions":[{"provider":"openai-codex","index":2,"label":"work"}]}"#,
         ])
 
-        let logins = discovery.piLogins()
+        let logins = makeDiscovery(files: files).piLogins()
 
         XCTAssertEqual(logins.map(\.providerID), ["openai-codex", "openai-codex-2"])
-        XCTAssertEqual(logins.map(\.accountID), ["acct-home", "acct-work"])
+        XCTAssertEqual(logins.map(\.identity.key), ["acct-home|me@home.test", "acct-work|me@work.test"])
         XCTAssertEqual(logins.map(\.label), [nil, "work"])
-        XCTAssertEqual(logins.map(\.email), ["me@home.test", "me@work.test"])
-        XCTAssertEqual(logins[1].expiresAt, Date(timeIntervalSince1970: 1_800_000_000))
+        XCTAssertEqual(Set(logins.map(\.authPath)), ["/Users/dev/.pi/agent/auth.json"])
+    }
+
+    func testHomesAndPiMergeByWorkspaceAndUserIdentity() async throws {
+        let files = FakeFiles([
+            "/Users/dev/.codex/auth.json": codexAuth(accountID: "ACCT-WORK", email: "me@work.test"),
+            "/Users/dev/.codex-work/auth.json": codexAuth(accountID: "ACCT-WORK", email: "me@work.test"),
+            "/Users/dev/.codex-personal/auth.json": codexAuth(accountID: "ACCT-HOME", email: "me@home.test"),
+            "/Users/dev/.pi/agent/auth.json": piAuth([
+                ("openai-codex", "ACCT-HOME", "me@home.test"),
+                ("openai-codex-2", "ACCT-WORK", "me@work.test"),
+            ]),
+            "/Users/dev/.pi/agent/multi-pass.json": #"{"subscriptions":[{"provider":"openai-codex","index":2,"label":"work"}]}"#,
+        ])
+
+        let assembly = await assemble(
+            files: files,
+            directories: ["/Users/dev": [".codex-work", ".codex-personal"]]
+        )
+
+        XCTAssertEqual(assembly.codexCards.count, 2)
+        let work = try XCTUnwrap(assembly.codexCards.first { $0.identity.key == "acct-work|me@work.test" })
+        let personal = try XCTUnwrap(assembly.codexCards.first { $0.identity.key == "acct-home|me@home.test" })
+        XCTAssertEqual(work.id, "codex")
+        XCTAssertEqual(personal.id, ProviderAccountID.make(
+            family: "codex", identityKey: "acct-home|me@home.test"
+        ))
+        XCTAssertEqual(work.displayName, "Codex: work")
+        XCTAssertEqual(work.authHomes, ["/Users/dev/.codex", "/Users/dev/.codex-work"])
+        XCTAssertEqual(personal.authHomes, ["/Users/dev/.codex-personal"])
+        XCTAssertEqual(work.piCredentialSources.map(\.providerID), ["openai-codex-2"])
+        XCTAssertEqual(personal.piCredentialSources.map(\.providerID), ["openai-codex"])
+        XCTAssertFalse(work.allowsUnattributedHistory)
+        XCTAssertFalse(personal.allowsUnattributedHistory)
+        XCTAssertEqual(assembly.identityKeysByCard["codex"], "acct-work|me@work.test")
+        XCTAssertEqual(assembly.identityKeysByCard[personal.id], "acct-home|me@home.test")
+    }
+
+    func testUsersInTheSameWorkspaceRemainSeparateCards() async {
+        let files = FakeFiles([
+            "/Users/dev/.codex/auth.json": codexAuth(accountID: "ACCT", email: "a@example.test"),
+            "/Users/dev/.codex-b/auth.json": codexAuth(accountID: "ACCT", email: "b@example.test"),
+        ])
+
+        let assembly = await assemble(files: files, directories: ["/Users/dev": [".codex-b"]])
+
+        XCTAssertEqual(assembly.codexCards.map(\.identity.key), [
+            "acct|a@example.test", "acct|b@example.test",
+        ])
+    }
+
+    func testRegistryOrderAndBareCardOwnershipSurviveDefaultSwitch() async throws {
+        let defaults = makeScratchDefaults()
+        let work = codexAuth(accountID: "ACCT-WORK", email: "me@work.test")
+        let personal = codexAuth(accountID: "ACCT-HOME", email: "me@home.test")
+        let directories = ["/Users/dev": [".codex-personal"]]
+
+        let first = await assemble(
+            files: FakeFiles([
+                "/Users/dev/.codex/auth.json": work,
+                "/Users/dev/.codex-personal/auth.json": personal,
+            ]),
+            directories: directories,
+            defaults: defaults
+        )
+        let personalID = try XCTUnwrap(first.codexCards.first {
+            $0.identity.key == "acct-home|me@home.test"
+        }?.id)
+
+        let swapped = await assemble(
+            files: FakeFiles([
+                "/Users/dev/.codex/auth.json": personal,
+                "/Users/dev/.codex-personal/auth.json": work,
+            ]),
+            directories: directories,
+            defaults: defaults
+        )
+
+        XCTAssertEqual(swapped.codexCards.map(\.id), ["codex", personalID])
+        XCTAssertEqual(swapped.identityKeysByCard["codex"], "acct-work|me@work.test")
+        XCTAssertEqual(swapped.identityKeysByCard[personalID], "acct-home|me@home.test")
+    }
+
+    func testPiOnlyAccountGetsAReadOnlyCredentialSource() async throws {
+        let files = FakeFiles([
+            "/Users/dev/.codex/auth.json": codexAuth(accountID: "ACCT-WORK", email: "me@work.test"),
+            "/Users/dev/.pi/agent/auth.json": piAuth([
+                ("openai-codex-2", "ACCT-HOME", "me@home.test"),
+            ]),
+        ])
+
+        let assembly = await assemble(files: files)
+        let personal = try XCTUnwrap(assembly.codexCards.first {
+            $0.identity.key == "acct-home|me@home.test"
+        })
+        XCTAssertTrue(personal.authHomes.isEmpty)
+        XCTAssertEqual(personal.piCredentialSources.map(\.providerID), ["openai-codex-2"])
+
+        let store = CodexAuthStore(
+            files: files,
+            keychain: FakeKeychain(),
+            expectedIdentity: personal.identity,
+            additionalAuthHomes: personal.authHomes,
+            piCredentialSources: personal.piCredentialSources
+        )
+        let candidate = try XCTUnwrap(store.loadAuthCandidates().first)
+        XCTAssertTrue(candidate.readOnly)
+        XCTAssertNil(candidate.auth.tokens?.refreshToken)
+        XCTAssertEqual(candidate.auth.tokens?.accountID, "acct-home")
+    }
+
+    func testPiCredentialsReloadAndFallBackAcrossMatchingProviderIDs() throws {
+        let expired = token(accountID: "ACCT", email: "me@test")
+        let current = token(accountID: "ACCT", email: "me@test", exp: Date(timeIntervalSince1970: 2_000_000_000))
+        let files = FakeFiles([
+            "/pi/auth.json": #"{"openai-codex":{"type":"oauth","access":"\#(expired)","accountId":"ACCT"},"openai-codex-2":{"type":"oauth","access":"\#(current)","accountId":"ACCT"}}"#,
+        ])
+        let identity = try XCTUnwrap(CodexAccountIdentity(accountID: "ACCT", email: "me@test"))
+        let sources = [
+            CodexPiCredentialSource(path: "/pi/auth.json", providerID: "openai-codex"),
+            CodexPiCredentialSource(path: "/pi/auth.json", providerID: "openai-codex-2"),
+        ]
+        let store = CodexAuthStore(
+            files: files,
+            keychain: FakeKeychain(),
+            expectedIdentity: identity,
+            piCredentialSources: sources
+        )
+
+        XCTAssertEqual(store.loadAuthCandidates().map { $0.auth.tokens?.accessToken }, [expired, current])
+
+        let renewed = token(accountID: "ACCT", email: "me@test", exp: Date(timeIntervalSince1970: 2_100_000_000))
+        files.files["/pi/auth.json"] = #"{"openai-codex":{"type":"oauth","access":"\#(renewed)","accountId":"ACCT"}}"#
+
+        XCTAssertEqual(store.loadAuthCandidates().map { $0.auth.tokens?.accessToken }, [renewed])
+    }
+
+    func testProviderFallsBackAcrossMatchingPiCredentials() async throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let first = token(accountID: "A", email: "a@test", exp: now.addingTimeInterval(3600))
+        let second = token(accountID: "A", email: "a@test", exp: now.addingTimeInterval(7200))
+        let files = FakeFiles([
+            "/pi/auth.json": #"{"openai-codex":{"type":"oauth","access":"\#(first)","accountId":"A"},"openai-codex-2":{"type":"oauth","access":"\#(second)","accountId":"A"}}"#,
+        ])
+        let http = RoutingHTTPClient { request in
+            if request.headers["Authorization"] == "Bearer \(first)" {
+                return HTTPResponse(statusCode: 401, headers: [:], body: Data())
+            }
+            return HTTPResponse(
+                statusCode: 200,
+                headers: [:],
+                body: Data(#"{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000}}}"#.utf8)
+            )
+        }
+        let identity = try XCTUnwrap(CodexAccountIdentity(accountID: "A", email: "a@test"))
+        let provider = CodexProvider(
+            authStore: CodexAuthStore(
+                files: files,
+                keychain: FakeKeychain(),
+                now: { now },
+                expectedIdentity: identity,
+                piCredentialSources: [
+                    .init(path: "/pi/auth.json", providerID: "openai-codex"),
+                    .init(path: "/pi/auth.json", providerID: "openai-codex-2"),
+                ]
+            ),
+            usageClient: CodexUsageClient(http: http),
+            now: { now }
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertNil(snapshot.errorCategory)
+        XCTAssertEqual(http.requests.prefix(2).map { $0.headers["Authorization"] }, [
+            "Bearer \(first)", "Bearer \(second)",
+        ])
+    }
+
+    func testChangedHomeLoginIsRejectedBeforeUse() throws {
+        let files = FakeFiles([
+            "/home/auth.json": codexAuth(accountID: "A", email: "a@test"),
+        ])
+        let identity = try XCTUnwrap(CodexAccountIdentity(accountID: "A", email: "a@test"))
+        let store = CodexAuthStore(
+            environment: FakeEnvironment(["CODEX_HOME": "/home"]),
+            files: files,
+            keychain: FakeKeychain(),
+            expectedIdentity: identity,
+            additionalAuthHomes: ["/home"]
+        )
+
+        XCTAssertNotNil(store.loadAuthCandidates().first)
+        files.files["/home/auth.json"] = codexAuth(accountID: "B", email: "b@test")
+        XCTAssertTrue(store.loadAuthCandidates().isEmpty)
+    }
+
+    func testRegularHomesRemainWritableWhileSwapAndPiSourcesAreReadOnly() throws {
+        let credential = codexAuth(accountID: "A", email: "a@test")
+        let files = FakeFiles([
+            "/home/auth.json": credential,
+            "/swap/auth.json": credential,
+            "/pi/auth.json": piAuth([("openai-codex", "A", "a@test")]),
+        ])
+        let identity = try XCTUnwrap(CodexAccountIdentity(accountID: "A", email: "a@test"))
+        let store = CodexAuthStore(
+            environment: FakeEnvironment(["CODEX_HOME": "/home"]),
+            files: files,
+            keychain: FakeKeychain(),
+            expectedIdentity: identity,
+            additionalAuthHomes: ["/swap"],
+            writableAuthHomes: ["/home"],
+            piCredentialSources: [.init(path: "/pi/auth.json", providerID: "openai-codex")]
+        )
+
+        let candidates = store.loadAuthCandidates()
+        XCTAssertEqual(candidates.count, 3)
+        XCTAssertFalse(candidates[0].readOnly)
+        XCTAssertNotNil(candidates[0].auth.tokens?.refreshToken)
+        XCTAssertTrue(candidates[1].readOnly)
+        XCTAssertNil(candidates[1].auth.tokens?.refreshToken)
+        XCTAssertTrue(candidates[2].readOnly)
+        XCTAssertNil(candidates[2].auth.tokens?.refreshToken)
+    }
+
+    func testRegularHomeRefreshPersistsMatchingRotatedCredentials() async throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let oldToken = token(accountID: "A", email: "a@test", exp: now.addingTimeInterval(-60))
+        let newToken = token(accountID: "A", email: "a@test", exp: now.addingTimeInterval(3600))
+        let auth = CodexAuth(
+            tokens: CodexTokens(accessToken: oldToken, refreshToken: "rt", idToken: oldToken, accountID: "A"),
+            lastRefresh: nil,
+            apiKey: nil
+        )
+        let files = FakeFiles([
+            "/home/auth.json": String(decoding: try JSONEncoder().encode(auth), as: UTF8.self),
+        ])
+        let http = RoutingHTTPClient { request in
+            if request.url.host == "auth.openai.com" {
+                return HTTPResponse(
+                    statusCode: 200,
+                    headers: [:],
+                    body: Data(#"{"access_token":"\#(newToken)","id_token":"\#(newToken)"}"#.utf8)
+                )
+            }
+            return HTTPResponse(
+                statusCode: 200,
+                headers: [:],
+                body: Data(#"{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000}}}"#.utf8)
+            )
+        }
+        let identity = try XCTUnwrap(CodexAccountIdentity(accountID: "A", email: "a@test"))
+        let provider = CodexProvider(
+            authStore: CodexAuthStore(
+                environment: FakeEnvironment(["CODEX_HOME": "/home"]),
+                files: files,
+                keychain: FakeKeychain(),
+                now: { now },
+                expectedIdentity: identity,
+                additionalAuthHomes: ["/home"],
+                writableAuthHomes: ["/home"]
+            ),
+            usageClient: CodexUsageClient(http: http),
+            now: { now }
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertNil(snapshot.errorCategory)
+        XCTAssertEqual(CodexAuthStore.parseAuth(try XCTUnwrap(files.files["/home/auth.json"]))?.tokens?.accessToken, newToken)
+        XCTAssertTrue(http.requests.contains { $0.headers["ChatGPT-Account-Id"] == "a" })
+    }
+
+    func testLoginChangedDuringRefreshIsNeverOverwritten() async throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let oldToken = token(accountID: "A", email: "a@test", exp: now.addingTimeInterval(-60))
+        let newToken = token(accountID: "A", email: "a@test", exp: now.addingTimeInterval(3600))
+        let auth = CodexAuth(
+            tokens: CodexTokens(accessToken: oldToken, refreshToken: "rt", idToken: oldToken, accountID: "A"),
+            lastRefresh: nil,
+            apiKey: nil
+        )
+        let replacement = codexAuth(accountID: "B", email: "b@test")
+        let files = FakeFiles([
+            "/home/auth.json": String(decoding: try JSONEncoder().encode(auth), as: UTF8.self),
+        ])
+        let http = RoutingHTTPClient { request in
+            if request.url.host == "auth.openai.com" {
+                files.files["/home/auth.json"] = replacement
+                return HTTPResponse(
+                    statusCode: 200,
+                    headers: [:],
+                    body: Data(#"{"access_token":"\#(newToken)","id_token":"\#(newToken)"}"#.utf8)
+                )
+            }
+            return HTTPResponse(statusCode: 500, headers: [:], body: Data())
+        }
+        let identity = try XCTUnwrap(CodexAccountIdentity(accountID: "A", email: "a@test"))
+        let provider = CodexProvider(
+            authStore: CodexAuthStore(
+                environment: FakeEnvironment(["CODEX_HOME": "/home"]),
+                files: files,
+                keychain: FakeKeychain(),
+                now: { now },
+                expectedIdentity: identity,
+                additionalAuthHomes: ["/home"],
+                writableAuthHomes: ["/home"]
+            ),
+            usageClient: CodexUsageClient(http: http),
+            now: { now }
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(snapshot.errorCategory, .authExpired)
+        XCTAssertEqual(files.files["/home/auth.json"], replacement)
+        XCTAssertEqual(http.requests.count, 1)
+    }
+
+    func testCatalogKeepsMultiAccountLocalHistoryUnattributedAndPiReadOnly() async {
+        let files = FakeFiles([
+            "/Users/dev/.codex/auth.json": codexAuth(accountID: "A", email: "a@test"),
+            "/Users/dev/.codex-b/auth.json": codexAuth(accountID: "B", email: "b@test"),
+            "/Users/dev/.pi/agent/auth.json": piAuth([
+                ("openai-codex", "A", "a@test"),
+                ("openai-codex-2", "B", "b@test"),
+            ]),
+        ])
+        let assembly = await assemble(files: files, directories: ["/Users/dev": [".codex-b"]])
+        let providers = ProviderCatalog.make(
+            defaults: makeScratchDefaults(),
+            codexCards: assembly.codexCards
+        ).compactMap { $0 as? CodexProvider }
+
+        XCTAssertEqual(providers.count, 2)
+        XCTAssertTrue(providers.allSatisfy { !$0.allowsUnattributedHistory })
+        XCTAssertEqual(providers.map { $0.authStore.piCredentialSources.count }, [1, 1])
+    }
+
+    func testDefaultObserverUsesConfiguredHomeListAndAccessTokenIdentity() {
+        let files = FakeFiles([
+            "/second/auth.json": codexAuth(
+                accountID: nil,
+                email: "me@test",
+                accessAccountID: "ACCT"
+            ),
+        ])
+        let observer = DefaultAccountObserver(
+            environment: FakeEnvironment(["CODEX_HOME": "/missing, /second"]),
+            files: files,
+            keychain: FakeKeychain(),
+            homeDirectory: { [home] in home }
+        )
+
+        XCTAssertEqual(
+            observer.observeCodex(),
+            .resolved(identityKey: "acct", label: "me@test", anchor: "/second")
+        )
     }
 
     func testPiCodexProviderIDShape() {
@@ -119,214 +496,6 @@ final class CodexMultiAccountTests: XCTestCase {
         XCTAssertTrue(CodexAccountDiscovery.isPiCodexProvider("openai-codex-12"))
         XCTAssertFalse(CodexAccountDiscovery.isPiCodexProvider("openai-codex-"))
         XCTAssertFalse(CodexAccountDiscovery.isPiCodexProvider("openai-codex-work"))
-        XCTAssertFalse(CodexAccountDiscovery.isPiCodexProvider("openai"))
-        XCTAssertEqual(PiProviderMapping.cardID(forPiProvider: "openai-codex-3"), "codex")
-    }
-
-
-    private func assemble(
-        files: [String: String],
-        directories: [String: [String]] = [:],
-        keychainValue: String? = nil,
-        defaults: UserDefaults? = nil
-    ) -> ProviderAccountAssembly {
-        let observer = DefaultAccountObserver(
-            environment: FakeEnvironment([:]),
-            files: FakeFiles(files),
-            keychain: FakeKeychain(keychainValue),
-            homeDirectory: { [home] in home }
-        )
-        return ProviderAccountAssembly.make(
-            observer: observer,
-            accountsStore: ProviderAccountsStore(defaults: defaults ?? makeScratchDefaults()),
-            families: ["codex"],
-            codexDiscovery: makeDiscovery(files: files, directories: directories)
-        )
-    }
-
-    func testTwoAccountsAcrossHomesAndPiBecomeTwoCardsMergedByIdentity() throws {
-        let files = [
-            "/Users/dev/.codex/auth.json": codexAuth(accountID: "ACCT-WORK", email: "me@work.test"),
-            "/Users/dev/.codex-work/auth.json": codexAuth(accountID: "ACCT-WORK", email: "me@work.test"),
-            "/Users/dev/.codex-personal/auth.json": codexAuth(accountID: "ACCT-HOME", email: "me@home.test"),
-            "/Users/dev/.pi/agent/auth.json": piAuth([
-                ("openai-codex", "ACCT-HOME", "me@home.test", 1_800_000_000_000),
-                ("openai-codex-2", "ACCT-WORK", "me@work.test", 1_800_000_000_000),
-            ]),
-            "/Users/dev/.pi/agent/multi-pass.json": #"{"subscriptions":[{"provider":"openai-codex","index":2,"label":"work"}]}"#,
-        ]
-        let assembly = assemble(files: files, directories: ["/Users/dev": [".codex-work", ".codex-personal"]])
-
-        XCTAssertEqual(assembly.codexCards.count, 2)
-        let work = try XCTUnwrap(assembly.codexCards.first { $0.identityKey == "acct-work" })
-        let personal = try XCTUnwrap(assembly.codexCards.first { $0.identityKey == "acct-home" })
-
-        XCTAssertEqual(work.id, "codex")
-        XCTAssertEqual(personal.id, ProviderAccountID.make(family: "codex", identityKey: "acct-home"))
-        XCTAssertEqual(work.displayName, "Codex: work")
-        XCTAssertEqual(personal.displayName, "Codex: me@home.test")
-        XCTAssertEqual(work.authPaths, ["/Users/dev/.codex/auth.json", "/Users/dev/.codex-work/auth.json"])
-        XCTAssertEqual(work.logHomes, ["/Users/dev/.codex", "/Users/dev/.codex-work"])
-        XCTAssertEqual(personal.logHomes, ["/Users/dev/.codex-personal"])
-        XCTAssertEqual(work.piProviderIDs, ["openai-codex-2"])
-        XCTAssertEqual(personal.piProviderIDs, ["openai-codex"])
-        XCTAssertTrue(work.ownsUnattributedSources)
-        XCTAssertFalse(personal.ownsUnattributedSources)
-        XCTAssertEqual(assembly.identityKeysByCard, ["codex": "acct-work", personal.id: "acct-home"])
-    }
-
-    func testSingleAccountStaysPlainCodexCard() {
-        let assembly = assemble(files: [
-            "/Users/dev/.codex/auth.json": codexAuth(accountID: "ACCT-1", email: "me@work.test"),
-            "/Users/dev/.pi/agent/auth.json": piAuth([("openai-codex", "ACCT-1", "me@work.test", 1_800_000_000_000)]),
-        ])
-
-        XCTAssertEqual(assembly.codexCards.map(\.id), ["codex"])
-        XCTAssertEqual(assembly.codexCards.first?.displayName, "Codex")
-        XCTAssertEqual(assembly.codexCards.first?.piProviderIDs, ["openai-codex"])
-        XCTAssertEqual(assembly.identityKeysByCard, ["codex": "acct-1"])
-    }
-
-    func testPiOnlyAccountBecomesACardWithoutHomeCredentials() throws {
-        let assembly = assemble(files: [
-            "/Users/dev/.codex/auth.json": codexAuth(accountID: "ACCT-WORK", email: "me@work.test"),
-            "/Users/dev/.pi/agent/auth.json": piAuth([("openai-codex-2", "ACCT-HOME", "me@home.test", 1_800_000_000_000)]),
-        ])
-
-        let personal = try XCTUnwrap(assembly.codexCards.first { $0.identityKey == "acct-home" })
-        XCTAssertTrue(personal.authPaths.isEmpty)
-        XCTAssertTrue(personal.logHomes.isEmpty)
-        XCTAssertEqual(personal.piLogin?.providerID, "openai-codex-2")
-        XCTAssertEqual(personal.displayName, "Codex: me@home.test")
-    }
-
-    func testKeychainCredentialLeavesTheFamilyUnscoped() {
-        let assembly = assemble(
-            files: [
-                "/Users/dev/.codex/auth.json": codexAuth(accountID: "ACCT-WORK", email: "me@work.test"),
-                "/Users/dev/.codex-personal/auth.json": codexAuth(accountID: "ACCT-HOME", email: "me@home.test"),
-            ],
-            directories: ["/Users/dev": [".codex-personal"]],
-            keychainValue: #"{"tokens":{"access_token":"kc"}}"#
-        )
-
-        XCTAssertTrue(assembly.codexCards.isEmpty, "an unresolved identity must not scope the Codex card")
-        XCTAssertTrue(assembly.identityKeysByCard.isEmpty)
-    }
-
-    func testCardIDsSurviveADefaultHomeSwap() throws {
-        let defaults = makeScratchDefaults()
-        let work = codexAuth(accountID: "ACCT-WORK", email: "me@work.test")
-        let personal = codexAuth(accountID: "ACCT-HOME", email: "me@home.test")
-        let directories = ["/Users/dev": [".codex-personal"]]
-
-        let first = assemble(
-            files: ["/Users/dev/.codex/auth.json": work, "/Users/dev/.codex-personal/auth.json": personal],
-            directories: directories, defaults: defaults
-        )
-        let personalID = try XCTUnwrap(first.codexCards.first { $0.identityKey == "acct-home" }).id
-
-        let swapped = assemble(
-            files: ["/Users/dev/.codex/auth.json": personal, "/Users/dev/.codex-personal/auth.json": work],
-            directories: directories, defaults: defaults
-        )
-
-        XCTAssertEqual(swapped.codexCards.first { $0.identityKey == "acct-home" }?.id, personalID)
-        XCTAssertEqual(swapped.codexCards.first { $0.identityKey == "acct-work" }?.id, "codex")
-        XCTAssertTrue(try XCTUnwrap(swapped.codexCards.first { $0.identityKey == "acct-home" }).ownsUnattributedSources)
-    }
-
-    func testCatalogBuildsOneScopedProviderPerCard() {
-        let assembly = assemble(
-            files: [
-                "/Users/dev/.codex/auth.json": codexAuth(accountID: "ACCT-WORK", email: "me@work.test"),
-                "/Users/dev/.codex-personal/auth.json": codexAuth(accountID: "ACCT-HOME", email: "me@home.test"),
-            ],
-            directories: ["/Users/dev": [".codex-personal"]]
-        )
-
-        let providers = ProviderCatalog.make(defaults: makeScratchDefaults(), codexCards: assembly.codexCards)
-        let codex = providers.compactMap { $0 as? CodexProvider }
-
-        XCTAssertEqual(codex.map(\.provider.id), assembly.codexCards.map(\.id))
-        XCTAssertEqual(codex.map(\.provider.displayName), ["Codex: me@work.test", "Codex: me@home.test"])
-        XCTAssertEqual(codex[1].authStore.explicitAuthPaths, ["/Users/dev/.codex-personal/auth.json"])
-        XCTAssertFalse(codex[1].authStore.includesKeychain)
-        XCTAssertFalse(codex[1].includesOpenCodeUsage)
-        XCTAssertTrue(codex[1].widgetDescriptors.allSatisfy { $0.id.hasPrefix("\(codex[1].provider.id).") })
-    }
-
-    func testDefaultLayoutTranslatesToExtraCodexCards() {
-        let translate = DefaultLayout.translatedForAccountCards(providerIDs: ["claude", "codex", "codex@ab12cd34", "cursor"])
-
-        XCTAssertEqual(
-            translate(["codex.session", "cursor.auto", "claude.weekly"]),
-            ["codex.session", "codex@ab12cd34.session", "cursor.auto", "claude.weekly"]
-        )
-    }
-
-
-    func testExpiredPiTokenAsksToRefreshInPiWithoutTouchingTheNetwork() async {
-        let now = Date(timeIntervalSince1970: 1_800_000_000)
-        let http = FakeHTTPClient(response: HTTPResponse(statusCode: 200, headers: [:], body: Data("{}".utf8)))
-        let login = PiCodexLogin(
-            providerID: "openai-codex-2", accountID: "acct-home", email: nil, planType: nil, label: nil,
-            accessToken: token(accountID: "acct-home", email: "me@home.test"),
-            expiresAt: now.addingTimeInterval(-60)
-        )
-        let provider = CodexProvider(
-            provider: CodexProvider.makeProvider(id: "codex@1", displayName: "Codex: home"),
-            authStore: CodexAuthStore(files: FakeFiles(), keychain: FakeKeychain(), now: { now },
-                                      explicitAuthPaths: [], includesKeychain: false, piLogin: login),
-            usageClient: CodexUsageClient(http: http),
-            now: { now }
-        )
-
-        let snapshot = await provider.refresh()
-
-        XCTAssertEqual(errorBadge(snapshot), CodexAuthError.piTokenExpired.errorDescription)
-        XCTAssertEqual(snapshot.errorCategory, .authExpired)
-        XCTAssertTrue(http.requests.isEmpty)
-    }
-
-    func testRejectedPiTokenIsNeverRefreshed() async {
-        let now = Date(timeIntervalSince1970: 1_800_000_000)
-        let http = FakeHTTPClient(response: HTTPResponse(statusCode: 401, headers: [:], body: Data()))
-        let login = PiCodexLogin(
-            providerID: "openai-codex-2", accountID: "acct-home", email: nil, planType: nil, label: nil,
-            accessToken: token(accountID: "acct-home", email: "me@home.test", exp: now.addingTimeInterval(3600)),
-            expiresAt: now.addingTimeInterval(3600)
-        )
-        let provider = CodexProvider(
-            provider: CodexProvider.makeProvider(id: "codex@1", displayName: "Codex: home"),
-            authStore: CodexAuthStore(files: FakeFiles(), keychain: FakeKeychain(), now: { now },
-                                      explicitAuthPaths: [], includesKeychain: false, piLogin: login),
-            usageClient: CodexUsageClient(http: http),
-            now: { now }
-        )
-
-        let snapshot = await provider.refresh()
-
-        XCTAssertEqual(errorBadge(snapshot), CodexAuthError.piTokenExpired.errorDescription)
-        XCTAssertEqual(http.requests.count, 1, "one usage attempt, no token-refresh call")
-        XCTAssertEqual(http.requests.first?.headers["ChatGPT-Account-Id"], "acct-home")
-    }
-
-    func testPiSpendSplitsByPiProviderID() {
-        let since = Date(timeIntervalSince1970: 0)
-        let tokens = TokenBreakdown(input: 10, cacheWrite5m: 0, cacheWrite1h: 0, cacheRead: 0, output: 5)
-        let entries = [
-            PiUsageScanner.Entry(id: "a", timestamp: Date(timeIntervalSince1970: 1_800_000_000), cardID: "codex",
-                                 piProviderID: "openai-codex", model: "gpt-5", carriedCost: 1, tokens: tokens, reportedTotalTokens: 15),
-            PiUsageScanner.Entry(id: "b", timestamp: Date(timeIntervalSince1970: 1_800_000_000), cardID: "codex",
-                                 piProviderID: "openai-codex-2", model: "gpt-5", carriedCost: 2, tokens: tokens, reportedTotalTokens: 15),
-        ]
-        let pricing = ModelPricing(supplement: PricingSupplement(), primary: PricingCatalog(entries: [:]), secondary: PricingCatalog(entries: [:]))
-
-        let all = PiUsageScanner.aggregate(entries: entries, cardID: "codex", since: since, pricing: pricing)
-        let second = PiUsageScanner.aggregate(entries: entries, cardID: "codex", piProviderIDs: ["openai-codex-2"], since: since, pricing: pricing)
-
-        XCTAssertEqual(all.series.daily.first?.costUSD, 3)
-        XCTAssertEqual(second.series.daily.first?.costUSD, 2)
+        XCTAssertNil(PiProviderMapping.cardID(forPiProvider: "openai-codex-3"))
     }
 }

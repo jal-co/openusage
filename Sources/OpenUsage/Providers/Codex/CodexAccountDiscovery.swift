@@ -2,8 +2,7 @@ import Foundation
 
 struct CodexHomeLogin: Equatable, Sendable {
     let home: String
-    let accountID: String
-    let email: String?
+    let identity: CodexAccountIdentity
     let planType: String?
 
     var authPath: String { home + "/auth.json" }
@@ -11,12 +10,10 @@ struct CodexHomeLogin: Equatable, Sendable {
 
 struct PiCodexLogin: Equatable, Sendable {
     let providerID: String
-    let accountID: String
-    let email: String?
+    let identity: CodexAccountIdentity
     let planType: String?
     let label: String?
-    let accessToken: String
-    let expiresAt: Date?
+    let authPath: String
 }
 
 struct CodexAccountDiscovery: Sendable {
@@ -40,45 +37,51 @@ struct CodexAccountDiscovery: Sendable {
     static func listSubdirectories(_ path: String) -> [String] {
         let urls = (try? FileManager.default.contentsOfDirectory(
             at: URL(fileURLWithPath: path),
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: []
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+            options: [.skipsHiddenFiles]
         )) ?? []
         return urls.compactMap { url in
-            guard (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true else { return nil }
+            guard let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+                  values.isDirectory == true, values.isSymbolicLink != true
+            else { return nil }
             return url.lastPathComponent
         }
     }
 
+    static func configuredHomeValues(environment: EnvironmentReading) -> [String] {
+        let homes = environment.value(for: "CODEX_HOME")?
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty } ?? []
+        return homes.isEmpty ? ["~/.config/codex", "~/.codex"] : homes
+    }
+
+    static func configuredHomes(environment: EnvironmentReading, homeDirectory: URL) -> [String] {
+        uniqueHomes(configuredHomeValues(environment: environment), homeDirectory: homeDirectory)
+    }
 
     func candidateHomes() -> [String] {
-        let home = homeDirectory().path
-        var homes: [String] = []
-        if let raw = environment.value(for: "CODEX_HOME")?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !raw.isEmpty {
-            homes += raw.split(separator: ",")
-                .map { $0.trimmingCharacters(in: .whitespaces) }
-                .filter { !$0.isEmpty }
-        }
-        homes += ["~/.config/codex", "~/.codex"]
-        homes += listDirectories(home)
+        let home = homeDirectory()
+        let siblingHomes = listDirectories(home.path)
             .filter { $0.hasPrefix(".codex-") }
             .sorted()
             .map { "~/\($0)" }
-        homes += listDirectories(home + "/.config")
+            + listDirectories(home.appendingPathComponent(".config").path)
             .filter { $0.hasPrefix("codex-") }
             .sorted()
             .map { "~/.config/\($0)" }
-
-        var seen: Set<String> = []
-        return homes.compactMap { raw in
-            let expanded = expandTilde(raw).trimmingTrailingSlashes
-            let key = URL(fileURLWithPath: expanded).standardizedFileURL.path
-            return seen.insert(key).inserted ? expanded : nil
-        }
+        return Self.uniqueHomes(
+            Self.configuredHomes(environment: environment, homeDirectory: home) + ["~/.config/codex", "~/.codex"] + siblingHomes,
+            homeDirectory: home
+        )
     }
 
-    func homeLogins() -> [CodexHomeLogin] {
-        candidateHomes().compactMap { home in
+    func homeLogins(additionalHomes: [String] = []) -> [CodexHomeLogin] {
+        let homes = Self.uniqueHomes(
+            candidateHomes() + additionalHomes,
+            homeDirectory: homeDirectory()
+        )
+        return homes.compactMap { home in
             let text: String?
             do {
                 text = try files.readTextIfPresent(home + "/auth.json")
@@ -88,25 +91,16 @@ struct CodexAccountDiscovery: Sendable {
             }
             guard let text,
                   let auth = CodexAuthStore.parseAuth(text),
-                  auth.tokens?.accessToken?.nilIfEmpty != nil
+                  auth.tokens?.accessToken?.nilIfEmpty != nil,
+                  let identity = CodexAccountIdentity(auth: auth)
             else { return nil }
-            let payload = auth.tokens?.idToken.flatMap { ProviderParse.jwtPayload($0) }
-                ?? auth.tokens?.accessToken.flatMap { ProviderParse.jwtPayload($0) }
-            let accountID = auth.tokens?.accountID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
-                ?? DefaultAccountObserver.chatGPTAccountID(inIDTokenPayload: payload)
-            guard let accountID else {
-                AppLog.info(.config, "accounts: Codex home \(home) names no account; not a card")
-                return nil
-            }
             return CodexHomeLogin(
                 home: home,
-                accountID: accountID.lowercased(),
-                email: Self.email(inTokenPayload: payload),
-                planType: Self.planType(inTokenPayload: payload)
+                identity: identity,
+                planType: Self.planType(inTokenPayload: Self.identityPayload(auth))
             )
         }
     }
-
 
     static let piCodexProviderPrefix = "openai-codex"
 
@@ -122,16 +116,17 @@ struct CodexAccountDiscovery: Sendable {
     func piAgentDirectory() -> String {
         if let configDir = environment.value(for: "PI_CODING_AGENT_DIR")?
             .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
-            return expandTilde(configDir).trimmingTrailingSlashes
+            return Self.expandTilde(configDir, homeDirectory: homeDirectory()).trimmingTrailingSlashes
         }
         return homeDirectory().appendingPathComponent(".pi/agent").path
     }
 
     func piLogins() -> [PiCodexLogin] {
         let agentDir = piAgentDirectory()
+        let authPath = agentDir + "/auth.json"
         let object: [String: Any]
         do {
-            guard let text = try files.readTextIfPresent(agentDir + "/auth.json") else { return [] }
+            guard let text = try files.readTextIfPresent(authPath) else { return [] }
             guard let parsed = try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any] else {
                 AppLog.error(.config, "accounts: pi auth.json is not a JSON object; pi Codex logins skipped")
                 return []
@@ -142,40 +137,71 @@ struct CodexAccountDiscovery: Sendable {
             return []
         }
         let labels = piSubscriptionLabels(agentDir: agentDir)
-
         return object.keys
             .filter(Self.isPiCodexProvider)
             .sorted { Self.piProviderIndex($0) < Self.piProviderIndex($1) }
-            .compactMap { providerID -> PiCodexLogin? in
-                guard let entry = object[providerID] as? [String: Any],
-                      entry["type"] as? String == "oauth",
-                      let accessToken = (entry["access"] as? String)?.nilIfEmpty
+            .compactMap { providerID in
+                guard let auth = Self.piAuth(in: object, providerID: providerID),
+                      let identity = CodexAccountIdentity(auth: auth),
+                      CodexAccountIdentity.isComplete(key: identity.key)
                 else { return nil }
-                let payload = ProviderParse.jwtPayload(accessToken)
-                let accountID = (entry["accountId"] as? String)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
-                    ?? DefaultAccountObserver.chatGPTAccountID(inIDTokenPayload: payload)
-                guard let accountID else {
-                    AppLog.info(.config, "accounts: pi login \(providerID) names no account; not a card")
-                    return nil
-                }
-                let expiresAt = ProviderParse.number(entry["expires"]).map { Date(timeIntervalSince1970: $0 / 1000) }
                 return PiCodexLogin(
                     providerID: providerID,
-                    accountID: accountID.lowercased(),
-                    email: Self.email(inTokenPayload: payload),
-                    planType: Self.planType(inTokenPayload: payload),
+                    identity: identity,
+                    planType: Self.planType(inTokenPayload: Self.identityPayload(auth)),
                     label: labels[providerID],
-                    accessToken: accessToken,
-                    expiresAt: expiresAt
+                    authPath: authPath
                 )
             }
+    }
+
+    static func loadPiAuth(files: TextFileAccessing, path: String, providerID: String) -> CodexAuth? {
+        guard let text = try? files.readTextIfPresent(path),
+              let object = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any]
+        else { return nil }
+        return piAuth(in: object, providerID: providerID)
     }
 
     static func piProviderIndex(_ providerID: String) -> Int {
         let suffix = providerID.dropFirst(piCodexProviderPrefix.count)
         guard suffix.hasPrefix("-"), let index = Int(suffix.dropFirst()) else { return 1 }
         return index
+    }
+
+    static func identityPayload(_ auth: CodexAuth) -> [String: Any]? {
+        if let payload = auth.tokens?.idToken.flatMap(ProviderParse.jwtPayload),
+           DefaultAccountObserver.chatGPTAccountID(inIDTokenPayload: payload) != nil {
+            return payload
+        }
+        return auth.tokens?.accessToken.flatMap(ProviderParse.jwtPayload)
+            ?? auth.tokens?.idToken.flatMap(ProviderParse.jwtPayload)
+    }
+
+    static func email(inTokenPayload payload: [String: Any]?) -> String? {
+        guard let payload else { return nil }
+        let profile = payload["https://api.openai.com/profile"] as? [String: Any]
+        return ((profile?["email"] ?? payload["email"]) as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty?.lowercased()
+    }
+
+    static func planType(inTokenPayload payload: [String: Any]?) -> String? {
+        guard let payload else { return nil }
+        let authClaim = payload["https://api.openai.com/auth"] as? [String: Any]
+        return (authClaim?["chatgpt_plan_type"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+    }
+
+    private static func piAuth(in object: [String: Any], providerID: String) -> CodexAuth? {
+        guard let entry = object[providerID] as? [String: Any],
+              entry["type"] as? String == "oauth",
+              let accessToken = (entry["access"] as? String)?.nilIfEmpty
+        else { return nil }
+        return CodexAuth(tokens: CodexTokens(
+            accessToken: accessToken,
+            refreshToken: nil,
+            idToken: nil,
+            accountID: (entry["accountId"] as? String)?.nilIfEmpty
+        ), lastRefresh: nil, apiKey: nil)
     }
 
     private func piSubscriptionLabels(agentDir: String) -> [String: String] {
@@ -188,7 +214,7 @@ struct CodexAccountDiscovery: Sendable {
             guard subscription["provider"] as? String == Self.piCodexProviderPrefix,
                   let index = ProviderParse.number(subscription["index"]).map({ Int($0) }),
                   let label = (subscription["label"] as? String)?
-                      .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+                    .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
             else { continue }
             let providerID = index <= 1 ? Self.piCodexProviderPrefix : "\(Self.piCodexProviderPrefix)-\(index)"
             labels[providerID] = label
@@ -196,23 +222,17 @@ struct CodexAccountDiscovery: Sendable {
         return labels
     }
 
-
-    static func email(inTokenPayload payload: [String: Any]?) -> String? {
-        guard let payload else { return nil }
-        let profile = payload["https://api.openai.com/profile"] as? [String: Any]
-        return ((profile?["email"] ?? payload["email"]) as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+    private static func uniqueHomes(_ homes: [String], homeDirectory: URL) -> [String] {
+        var seen = Set<String>()
+        return homes.compactMap { raw in
+            let expanded = expandTilde(raw, homeDirectory: homeDirectory).trimmingTrailingSlashes
+            let standardized = URL(fileURLWithPath: expanded).standardizedFileURL.path
+            return seen.insert(standardized).inserted ? standardized : nil
+        }
     }
 
-    static func planType(inTokenPayload payload: [String: Any]?) -> String? {
-        guard let payload else { return nil }
-        let authClaim = payload["https://api.openai.com/auth"] as? [String: Any]
-        return (authClaim?["chatgpt_plan_type"] as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
-    }
-
-    private func expandTilde(_ path: String) -> String {
+    private static func expandTilde(_ path: String, homeDirectory: URL) -> String {
         guard path == "~" || path.hasPrefix("~/") else { return path }
-        return homeDirectory().path + String(path.dropFirst(1))
+        return homeDirectory.path + String(path.dropFirst(1))
     }
 }

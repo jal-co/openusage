@@ -90,7 +90,11 @@ struct ProviderAccountAssembly {
         }
     ) async -> ProviderAccountAssembly {
         let codexCards = families.contains("codex")
-            ? await makeCodexCards(observer: observer, accountsStore: accountsStore) : []
+            ? await makeCodexCards(
+                observer: observer,
+                accountsStore: accountsStore,
+                discovery: codexDiscovery
+            ) : []
         var identityKeys = Dictionary(uniqueKeysWithValues: codexCards.map { ($0.id, $0.identity.key) })
         var observations: [ProviderAccountsStore.Observation] = []
 
@@ -117,19 +121,6 @@ struct ProviderAccountAssembly {
             case .absent:
                 AppLog.debug(.config, "accounts: \(family) has no default login")
             }
-        }
-
-        var codexCards: [CodexAccountCard] = []
-        if families.contains("codex") {
-            codexCards = assembleCodexCards(
-                outcome: outcomes.first(where: { $0.family == "codex" })?.outcome,
-                discovery: codexDiscovery ?? CodexAccountDiscovery(
-                    environment: observer.environment, files: observer.files, homeDirectory: observer.homeDirectory
-                ),
-                observations: &observations,
-                reconcile: { accountsStore.reconcile(with: $0) },
-                identityKeys: &identityKeys
-            )
         }
 
         guard families.contains("claude") else {
