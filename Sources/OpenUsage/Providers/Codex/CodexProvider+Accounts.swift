@@ -48,6 +48,10 @@ extension CodexProvider {
                     let result = await snapshot(mapped: mapped)
                     guard await authStore.isCurrent(currentState) else { changed = true; break }
                     return result
+                } catch let error as CodexAuthError where error.allowsAuthFallback {
+                    guard await authStore.isCurrent(currentState) else { changed = true; break }
+                    AppLog.warn(LogTag.auth("codex"), "account credential failed (\(error)); trying a matching login")
+                    continue
                 } catch {
                     guard await authStore.isCurrent(currentState) else { changed = true; break }
                     return ProviderSnapshot.error(provider: provider, error: error)

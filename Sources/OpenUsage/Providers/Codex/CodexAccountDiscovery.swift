@@ -37,8 +37,7 @@ struct CodexAccountDiscovery: Sendable {
     static func listSubdirectories(_ path: String) -> [String] {
         let urls = (try? FileManager.default.contentsOfDirectory(
             at: URL(fileURLWithPath: path),
-            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
-            options: [.skipsHiddenFiles]
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey]
         )) ?? []
         return urls.compactMap { url in
             guard let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),

@@ -148,8 +148,9 @@ struct DefaultAccountObserver: Sendable {
             guard let auth = CodexAuthStore.parseAuth(text),
                   auth.tokens?.accessToken?.nilIfEmpty != nil
             else { continue }
-            if let identity = CodexAccountIdentity(auth: auth) {
-                return .resolved(identityKey: identity.accountID, label: identity.email, anchor: anchor)
+            if let identity = CodexAccountIdentity(auth: auth),
+               let accountID = identity.accountID.nilIfEmpty {
+                return .resolved(identityKey: accountID, label: identity.email, anchor: anchor)
             }
         }
         return sawFootprint

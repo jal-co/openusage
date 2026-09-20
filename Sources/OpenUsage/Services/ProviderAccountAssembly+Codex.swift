@@ -139,7 +139,7 @@ extension ProviderAccountAssembly {
                     : labels[identity.key] ?? "Codex",
                 authHomes: authHomes,
                 writableAuthHomes: matchingHomes.filter { home in
-                    !matchingSwaps.contains(where: { $0.home == home })
+                    !matchingSwaps.contains { $0.home == home || $0.mainHome == home }
                 },
                 piCredentialSources: matchingPi,
                 logHomes: allLogHomes,
