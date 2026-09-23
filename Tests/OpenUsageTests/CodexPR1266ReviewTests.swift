@@ -180,4 +180,140 @@ final class CodexPR1266ReviewTests: XCTestCase {
             .unresolved(reason: "credentials present but no account identity")
         )
     }
+
+    func testSwapHomesStayReadOnlyWhenRegistryIdentityOmitsEmail() async throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let expired = token(accountID: "A", email: "a@test", exp: now.addingTimeInterval(-60))
+        let credential = authJSON(accountID: "A", email: "a@test", accessToken: expired)
+        let files = FakeFiles([
+            "/test/swap/accounts.json": #"{"schemaVersion":1,"mainHome":"/test/main","accounts":[{"number":1,"alias":"A","home":"/test/saved","identity":{"accountId":"A"}}]}"#,
+            "/test/main/auth.json": credential,
+            "/test/saved/auth.json": credential,
+        ])
+        let environment = FakeEnvironment(["CODEX_HOME": "/test/main", "XSWAP_HOME": "/test/swap"])
+        let observer = DefaultAccountObserver(
+            environment: environment,
+            files: files,
+            keychain: FakeKeychain(),
+            homeDirectory: { URL(fileURLWithPath: "/test") }
+        )
+        let assembly = await ProviderAccountAssembly.make(
+            observer: observer,
+            accountsStore: ProviderAccountsStore(defaults: defaults()),
+            families: ["codex"],
+            codexDiscovery: CodexAccountDiscovery(
+                environment: environment,
+                files: files,
+                homeDirectory: { URL(fileURLWithPath: "/test") },
+                listDirectories: { _ in [] }
+            )
+        )
+        XCTAssertFalse(assembly.codexCards.isEmpty)
+
+        let http = RoutingHTTPClient { _ in
+            XCTFail("Swap-managed credentials must not rotate")
+            return HTTPResponse(statusCode: 500, headers: [:], body: Data())
+        }
+        for card in assembly.codexCards {
+            XCTAssertTrue(card.writableAuthHomes.isEmpty)
+            let provider = CodexProvider(
+                authStore: CodexAuthStore(
+                    environment: environment,
+                    files: files,
+                    keychain: FakeKeychain(),
+                    now: { now },
+                    expectedIdentity: card.identity,
+                    additionalAuthHomes: card.authHomes,
+                    writableAuthHomes: Set(card.writableAuthHomes)
+                ),
+                usageClient: CodexUsageClient(http: http),
+                now: { now }
+            )
+            _ = await provider.refresh()
+        }
+
+        XCTAssertTrue(http.requests.isEmpty)
+        XCTAssertEqual(files.files["/test/main/auth.json"], credential)
+        XCTAssertEqual(files.files["/test/saved/auth.json"], credential)
+    }
+
+    func testIncompleteDefaultLoginBlocksUnattributedHistoryForSiblingAccount() async throws {
+        let accountOnly = "\(b64url(#"{"alg":"RS256"}"#)).\(b64url(#"{"https://api.openai.com/auth":{"chatgpt_account_id":"A"}}"#)).sig"
+        let defaultAuth = CodexAuth(
+            tokens: CodexTokens(accessToken: accountOnly, refreshToken: "rt", idToken: accountOnly, accountID: "A"),
+            lastRefresh: nil,
+            apiKey: nil
+        )
+        let files = FakeFiles([
+            "/test/.codex/auth.json": String(decoding: try JSONEncoder().encode(defaultAuth), as: UTF8.self),
+            "/test/.codex-b/auth.json": authJSON(accountID: "B", email: "b@test"),
+        ])
+        let environment = FakeEnvironment([:])
+        let assembly = await ProviderAccountAssembly.make(
+            observer: DefaultAccountObserver(
+                environment: environment,
+                files: files,
+                keychain: FakeKeychain(),
+                homeDirectory: { URL(fileURLWithPath: "/test") }
+            ),
+            accountsStore: ProviderAccountsStore(defaults: defaults()),
+            families: ["codex"],
+            codexDiscovery: CodexAccountDiscovery(
+                environment: environment,
+                files: files,
+                homeDirectory: { URL(fileURLWithPath: "/test") },
+                listDirectories: { $0 == "/test" ? [".codex-b"] : [] }
+            )
+        )
+
+        let card = try XCTUnwrap(assembly.codexCards.first)
+        XCTAssertEqual(assembly.codexCards.count, 1)
+        XCTAssertEqual(card.identity.key, "b|b@test")
+        XCTAssertFalse(card.allowsUnattributedHistory)
+    }
+
+    func testRejectedUnexpiredHomeTokenRenewsAndRetries() async throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let rejected = token(accountID: "A", email: "a@test", exp: now.addingTimeInterval(3600))
+        let renewed = token(accountID: "A", email: "a@test", exp: now.addingTimeInterval(7200))
+        let files = FakeFiles([
+            "/home/auth.json": authJSON(accountID: "A", email: "a@test", accessToken: rejected),
+        ])
+        let http = RoutingHTTPClient { request in
+            if request.url.host == "auth.openai.com" {
+                return HTTPResponse(
+                    statusCode: 200,
+                    headers: [:],
+                    body: Data(#"{"access_token":"\#(renewed)","refresh_token":"rt2"}"#.utf8)
+                )
+            }
+            if request.headers["Authorization"] == "Bearer \(rejected)" {
+                return HTTPResponse(statusCode: 401, headers: [:], body: Data())
+            }
+            return HTTPResponse(
+                statusCode: 200,
+                headers: [:],
+                body: Data(#"{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000}}}"#.utf8)
+            )
+        }
+        let provider = CodexProvider(
+            authStore: CodexAuthStore(
+                environment: FakeEnvironment(["CODEX_HOME": "/home"]),
+                files: files,
+                keychain: FakeKeychain(),
+                now: { now },
+                expectedIdentity: try XCTUnwrap(CodexAccountIdentity(accountID: "A", email: "a@test")),
+                writableAuthHomes: ["/home"]
+            ),
+            usageClient: CodexUsageClient(http: http),
+            now: { now }
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertNil(snapshot.errorCategory)
+        XCTAssertEqual(http.requests[1].url.host, "auth.openai.com")
+        XCTAssertEqual(http.requests[2].headers["Authorization"], "Bearer \(renewed)")
+        XCTAssertTrue(files.files["/home/auth.json"]?.contains(renewed) == true)
+    }
 }

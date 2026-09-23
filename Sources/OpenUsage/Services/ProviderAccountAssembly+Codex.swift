@@ -30,8 +30,12 @@ extension ProviderAccountAssembly {
         let hasEstablishedAccounts = !swaps.isEmpty || accountsStore.records.contains(where: {
             $0.family == "codex" && $0.identityKey.contains("|")
         })
-        let homes = discovery.homeLogins(additionalHomes: swaps.map(\.mainHome)).filter {
+        let discoveredHomes = discovery.homeLogins(additionalHomes: swaps.map(\.mainHome))
+        let homes = discoveredHomes.filter {
             hasEstablishedAccounts || CodexAccountIdentity.isComplete(key: $0.identity.key)
+        }
+        let incompleteHomeIdentities = discoveredHomes.map(\.identity).filter {
+            !CodexAccountIdentity.isComplete(key: $0.key)
         }
         let piLogins = discovery.piLogins()
         guard hasEstablishedAccounts || !homes.isEmpty || !piLogins.isEmpty else { return [] }
@@ -115,8 +119,16 @@ extension ProviderAccountAssembly {
         }
 
         let records = accountsStore.reconcile(with: observations)
-        let allowsUnattributed = records.count { $0.family == "codex" } == 1
-        let allLogHomes = Array(Set(homes.map(\.home) + swaps.flatMap { [$0.mainHome, $0.home] })).sorted()
+        let codexRecords = records.filter { $0.family == "codex" }
+        let allowsUnattributed = codexRecords.count == 1
+            && identities.first(where: { $0.key == codexRecords[0].identityKey }).map { owner in
+                incompleteHomeIdentities.allSatisfy {
+                    ($0.accountID.isEmpty || $0.accountID == owner.accountID)
+                        && ($0.email == nil || $0.email == owner.email)
+                }
+            } == true
+        let swapManagedHomes = Set(swaps.flatMap { [$0.mainHome, $0.home] })
+        let allLogHomes = Array(Set(homes.map(\.home)).union(swapManagedHomes)).sorted()
 
         return records.compactMap { record in
             guard record.family == "codex",
@@ -138,9 +150,7 @@ extension ProviderAccountAssembly {
                     ? "Codex"
                     : labels[identity.key] ?? "Codex",
                 authHomes: authHomes,
-                writableAuthHomes: matchingHomes.filter { home in
-                    !matchingSwaps.contains { $0.home == home || $0.mainHome == home }
-                },
+                writableAuthHomes: matchingHomes.filter { !swapManagedHomes.contains($0) },
                 piCredentialSources: matchingPi,
                 logHomes: allLogHomes,
                 allowsUnattributedHistory: allowsUnattributed
