@@ -238,6 +238,17 @@ final class CodexPR1266ReviewTests: XCTestCase {
     }
 
     func testIncompleteDefaultLoginBlocksUnattributedHistoryForSiblingAccount() async throws {
+        try await assertIncompleteDefaultLoginBlocksUnattributedHistory(siblingAccountID: "B", siblingKey: "b|b@test")
+    }
+
+    func testIncompleteDefaultLoginBlocksUnattributedHistoryForSameWorkspaceSibling() async throws {
+        try await assertIncompleteDefaultLoginBlocksUnattributedHistory(siblingAccountID: "A", siblingKey: "a|b@test")
+    }
+
+    private func assertIncompleteDefaultLoginBlocksUnattributedHistory(
+        siblingAccountID: String,
+        siblingKey: String
+    ) async throws {
         let accountOnly = "\(b64url(#"{"alg":"RS256"}"#)).\(b64url(#"{"https://api.openai.com/auth":{"chatgpt_account_id":"A"}}"#)).sig"
         let defaultAuth = CodexAuth(
             tokens: CodexTokens(accessToken: accountOnly, refreshToken: "rt", idToken: accountOnly, accountID: "A"),
@@ -246,7 +257,7 @@ final class CodexPR1266ReviewTests: XCTestCase {
         )
         let files = FakeFiles([
             "/test/.codex/auth.json": String(decoding: try JSONEncoder().encode(defaultAuth), as: UTF8.self),
-            "/test/.codex-b/auth.json": authJSON(accountID: "B", email: "b@test"),
+            "/test/.codex-b/auth.json": authJSON(accountID: siblingAccountID, email: "b@test"),
         ])
         let environment = FakeEnvironment([:])
         let assembly = await ProviderAccountAssembly.make(
@@ -268,7 +279,7 @@ final class CodexPR1266ReviewTests: XCTestCase {
 
         let card = try XCTUnwrap(assembly.codexCards.first)
         XCTAssertEqual(assembly.codexCards.count, 1)
-        XCTAssertEqual(card.identity.key, "b|b@test")
+        XCTAssertEqual(card.identity.key, siblingKey)
         XCTAssertFalse(card.allowsUnattributedHistory)
     }
 

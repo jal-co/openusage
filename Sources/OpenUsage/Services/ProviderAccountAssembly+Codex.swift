@@ -34,8 +34,8 @@ extension ProviderAccountAssembly {
         let homes = discoveredHomes.filter {
             hasEstablishedAccounts || CodexAccountIdentity.isComplete(key: $0.identity.key)
         }
-        let incompleteHomeIdentities = discoveredHomes.map(\.identity).filter {
-            !CodexAccountIdentity.isComplete(key: $0.key)
+        let hasIncompleteHomeLogin = discoveredHomes.contains {
+            !CodexAccountIdentity.isComplete(key: $0.identity.key)
         }
         let piLogins = discovery.piLogins()
         guard hasEstablishedAccounts || !homes.isEmpty || !piLogins.isEmpty else { return [] }
@@ -119,14 +119,7 @@ extension ProviderAccountAssembly {
         }
 
         let records = accountsStore.reconcile(with: observations)
-        let codexRecords = records.filter { $0.family == "codex" }
-        let allowsUnattributed = codexRecords.count == 1
-            && identities.first(where: { $0.key == codexRecords[0].identityKey }).map { owner in
-                incompleteHomeIdentities.allSatisfy {
-                    ($0.accountID.isEmpty || $0.accountID == owner.accountID)
-                        && ($0.email == nil || $0.email == owner.email)
-                }
-            } == true
+        let allowsUnattributed = !hasIncompleteHomeLogin && records.count { $0.family == "codex" } == 1
         let swapManagedHomes = Set(swaps.flatMap { [$0.mainHome, $0.home] })
         let allLogHomes = Array(Set(homes.map(\.home)).union(swapManagedHomes)).sorted()
 
